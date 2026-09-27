@@ -2,112 +2,157 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>Rail Auto-Booker</title>
+  <title>Train Ticket Automation</title>
   <link rel="stylesheet" href="popup.css">
 </head>
 <body>
-  <header>
-    <h1>Rail Auto-Booker</h1>
-    <p>Stops at the OTP screen. It never enters a code or pays.</p>
-  </header>
-
-  <form id="config-form">
-    <label>
-      From station
-      <input id="fromStation" name="fromStation" list="station-list" autocomplete="off" placeholder="Dhaka" required>
-    </label>
-    <label>
-      To station
-      <input id="toStation" name="toStation" list="station-list" autocomplete="off" placeholder="Chattogram" required>
-    </label>
-    <datalist id="station-list"></datalist>
-
-    <div class="row">
-      <label>
-        Journey date
-        <input id="journeyDate" name="journeyDate" type="date" required>
-      </label>
-      <label>
-        Class
-        <select id="trainClass" name="trainClass" required>
-          <option value="AC_B">AC_B — AC Berth</option>
-          <option value="AC_S">AC_S — AC Seat</option>
-          <option value="SNIGDHA">SNIGDHA — Snigdha</option>
-          <option value="F_BERTH">F_BERTH — First Berth</option>
-          <option value="F_SEAT">F_SEAT — First Seat</option>
-          <option value="F_CHAIR">F_CHAIR — First Chair</option>
-          <option value="S_CHAIR">S_CHAIR — Shovon Chair</option>
-          <option value="SHOVAN">SHOVAN — Shovon</option>
-          <option value="SHULOV">SHULOV — Shulov</option>
-          <option value="AC_CHAIR">AC_CHAIR — AC Chair</option>
-        </select>
-      </label>
-    </div>
-
-    <label>
-      Target train name or number
-      <input id="targetTrain" name="targetTrain" placeholder="PARJOTAK EXPRESS (816)" required>
-    </label>
-
-    <div class="row">
-      <label>
-        Preferred coach
-        <input id="preferredCoach" name="preferredCoach" placeholder="TA" maxlength="8">
-      </label>
-      <label>
-        Seat quantity
-        <input id="seatQuantity" name="seatQuantity" type="number" min="1" max="4" value="1" required>
-      </label>
-    </div>
-
-    <label>
-      Preferred seats
-      <input id="preferredSeats" name="preferredSeats" placeholder="TA-49, TA-50">
-    </label>
-
-    <label>
-      Boarding station
-      <input id="boardingStation" name="boardingStation" list="station-list" autocomplete="off" placeholder="Blank = site default (origin)">
-    </label>
-
-    <label class="check">
-      <input id="allowCoachFallback" name="allowCoachFallback" type="checkbox">
-      If the preferred coach cannot fill the quantity, try the next coach with seats
-    </label>
-
-    <fieldset>
-      <legend>Scheduled trigger</legend>
-      <label>
-        Date
-        <input id="scheduleDate" name="scheduleDate" type="date" required>
-      </label>
-      <div class="time-row">
-        <label>HH<input id="scheduleHour" name="scheduleHour" inputmode="numeric" maxlength="2" placeholder="08" required></label>
-        <label>MM<input id="scheduleMinute" name="scheduleMinute" inputmode="numeric" maxlength="2" placeholder="00" required></label>
-        <label>SS<input id="scheduleSecond" name="scheduleSecond" inputmode="numeric" maxlength="2" placeholder="00" required></label>
-        <label>MS<input id="scheduleMs" name="scheduleMs" inputmode="numeric" maxlength="3" placeholder="000" required></label>
+  <div class="shell">
+    <header>
+      <div class="brand">
+        <span class="prompt">&gt;_</span>
+        <div>
+          <h1>Train Ticket Automation</h1>
+          <p>Stops at OTP screen.</p>
+        </div>
       </div>
-    </fieldset>
+      <div class="live">
+        <span class="dot"></span>
+        <span>LIVE</span>
+      </div>
+    </header>
 
-    <p id="url-preview" class="preview"></p>
-    <p id="form-message" class="form-message" hidden></p>
+    <form id="config-form">
+      <div class="layout">
+        <section class="panel">
+          <h2>// route config</h2>
+          <div class="row">
+            <label>
+              From station
+              <select id="fromStation" name="fromStation" required></select>
+            </label>
+            <label>
+              To station
+              <select id="toStation" name="toStation" required></select>
+            </label>
+          </div>
+          <div class="row">
+            <label>
+              Journey date
+              <input id="journeyDate" name="journeyDate" type="date" required>
+            </label>
+            <div class="stack">
+              <label>
+                Class
+                <select id="trainClass" name="trainClass" required>
+                  <option value="AC_B">AC_B — AC Berth</option>
+                  <option value="AC_S">AC_S — AC Seat</option>
+                  <option value="SNIGDHA" selected>SNIGDHA — Snigdha</option>
+                  <option value="F_BERTH">F_BERTH — First Berth</option>
+                  <option value="F_SEAT">F_SEAT — First Seat</option>
+                  <option value="F_CHAIR">F_CHAIR — First Chair</option>
+                  <option value="S_CHAIR">S_CHAIR — Shovon Chair</option>
+                  <option value="SHOVAN">SHOVAN — Shovon</option>
+                  <option value="SHULOV">SHULOV — Shulov</option>
+                  <option value="AC_CHAIR">AC_CHAIR — AC Chair</option>
+                </select>
+              </label>
+              <label class="check">
+                <input id="allowClassFallback" name="allowClassFallback" type="checkbox">
+                <span>Any class if this one is full</span>
+              </label>
+            </div>
+          </div>
+          <div class="stack">
+            <label>
+              Target train
+              <select id="targetTrain" name="targetTrain" required></select>
+            </label>
+            <label class="check">
+              <input id="allowTrainFallback" name="allowTrainFallback" type="checkbox">
+              <span>Any train if this one has no seats</span>
+            </label>
+          </div>
+          <div class="row">
+            <div class="stack">
+              <label>
+                Preferred coach
+                <select id="preferredCoach" name="preferredCoach"></select>
+              </label>
+              <label class="check">
+                <input id="allowCoachFallback" name="allowCoachFallback" type="checkbox">
+                <span>Any coach if this one is full</span>
+              </label>
+            </div>
+            <label>
+              Seat quantity
+              <select id="seatQuantity" name="seatQuantity" required>
+                <option value="1">1</option>
+                <option value="2">2</option>
+                <option value="3">3</option>
+                <option value="4">4</option>
+              </select>
+            </label>
+          </div>
+          <div class="seat-block">
+            <span class="block-label">Preferred seats</span>
+            <div class="seat-grid">
+              <label>Seat 1<select id="seatPick1"></select></label>
+              <label hidden>Seat 2<select id="seatPick2"></select></label>
+              <label hidden>Seat 3<select id="seatPick3"></select></label>
+              <label hidden>Seat 4<select id="seatPick4"></select></label>
+            </div>
+          </div>
+          <label class="check">
+            <input id="allowSeatFallback" name="allowSeatFallback" type="checkbox">
+            <span>Any seats if the ones above are taken</span>
+          </label>
+          <label class="check">
+            <input id="continueToOtp" name="continueToOtp" type="checkbox">
+            <span>Till OTP page. When this is off, automation stops after the seats are selected so you can click Continue Purchase yourself.</span>
+          </label>
+        </section>
 
-    <div class="actions">
-      <button type="button" id="save-btn">Save Config</button>
-      <button type="button" id="arm-btn" class="primary">Arm / Start Countdown</button>
-      <button type="button" id="disarm-btn" class="danger">Cancel / Disarm</button>
-    </div>
-  </form>
+        <section class="panel side">
+          <h2>// trigger clock</h2>
+          <label>
+            Date
+            <input id="scheduleDate" name="scheduleDate" type="date" required>
+          </label>
+          <div class="time-row">
+            <label>HH<input id="scheduleHour" name="scheduleHour" inputmode="numeric" maxlength="2" placeholder="08" required></label>
+            <label>MM<input id="scheduleMinute" name="scheduleMinute" inputmode="numeric" maxlength="2" placeholder="00" required></label>
+            <label>SS<input id="scheduleSecond" name="scheduleSecond" inputmode="numeric" maxlength="2" placeholder="00" required></label>
+            <label>MS<input id="scheduleMs" name="scheduleMs" inputmode="numeric" maxlength="3" placeholder="000" required></label>
+            <label>AM/PM
+              <select id="schedulePeriod" name="schedulePeriod">
+                <option value="AM">AM</option>
+                <option value="PM">PM</option>
+              </select>
+            </label>
+          </div>
+          <p id="fire-at" class="preview"></p>
 
-  <section id="status-panel">
-    <div class="status-line">
-      <span id="phase-badge">IDLE</span>
-      <span id="countdown">—</span>
-    </div>
-    <p id="drift"></p>
-    <p id="last-log">No log yet.</p>
-    <ol id="log-list"></ol>
-  </section>
+          <div id="status-panel">
+            <div class="status-line">
+              <span id="phase-badge">IDLE</span>
+              <span id="countdown">—</span>
+            </div>
+            <p id="drift"></p>
+            <p id="last-log">No log yet.</p>
+            <ol id="log-list"></ol>
+          </div>
+
+          <p id="url-preview" class="preview"></p>
+          <p id="form-message" class="form-message" hidden></p>
+          <div class="actions">
+            <button type="button" id="save-btn">Save Config</button>
+            <button type="button" id="arm-btn" class="primary">Start Countdown</button>
+            <button type="button" id="disarm-btn" class="danger">Cancel / Disarm</button>
+          </div>
+        </section>
+      </div>
+    </form>
+  </div>
 
   <script src="utils/stations.js"></script>
   <script src="popup.js"></script>

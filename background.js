@@ -100,7 +100,14 @@ async function fire(targetTimestamp, token) {
 
   const firedAt = Date.now();
   const driftMs = firedAt - targetTimestamp;
-  await setState({ phase: "SEARCHING", firedAt, driftMs, lastError: null });
+  await setState({
+    phase: "SEARCHING",
+    firedAt,
+    driftMs,
+    lastError: null,
+    activeClass: "",
+    triedClasses: []
+  });
   const sign = driftMs > 0 ? "+" : "";
   await log(`Trigger fired. Drift ${sign}${driftMs} ms (target ${targetTimestamp}, fired ${firedAt}).`);
 
@@ -208,10 +215,21 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       .catch((error) => sendResponse({ ok: false, error: error.message || String(error) }));
     return true;
   }
+  if (message?.type === "SHOW_SUMMARY") {
+    cancelLoop();
+    chrome.alarms.clear(ALARM)
+      .then(() => openSummaryWindow())
+      .then(() => sendResponse({ ok: true }))
+      .catch((error) => sendResponse({ ok: false, error: error.message || String(error) }));
+    return true;
+  }
   return false;
 });
 
+let summaryOpen = null;
+
 async function arm(targetTimestamp) {
+  summaryOpen = null;
   if (!Number.isFinite(targetTimestamp)) throw new Error("Invalid trigger time.");
   if (targetTimestamp <= Date.now()) throw new Error("Trigger time is already in the past.");
   cancelLoop();
@@ -222,7 +240,9 @@ async function arm(targetTimestamp) {
     firedAt: null,
     driftMs: null,
     lastError: null,
-    formFallbackTried: false
+    formFallbackTried: false,
+    activeClass: "",
+    triedClasses: []
   });
   await log(`Armed for ${new Date(targetTimestamp).toLocaleString()}.`);
   await scheduleWake(targetTimestamp);
@@ -238,3 +258,85 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 });
 
 resumeIfArmed();
+
+const PANEL_WIDTH = 800;
+const PANEL_HEIGHT = 680;
+
+function panelUrl() {
+  return chrome.runtime.getURL("popup.html");
+}
+
+async function centerOnBrowser(width, height) {
+  const browser = await chrome.windows.getLastFocused({ windowTypes: ["normal"] });
+  const left = Math.round((browser.left || 0) + ((browser.width || width) - width) / 2);
+  const top = Math.round((browser.top || 0) + ((browser.height || height) - height) / 2);
+  return { left, top };
+}
+
+async function openCenteredPanel() {
+  const url = panelUrl();
+  const popups = await chrome.windows.getAll({ populate: true, windowTypes: ["popup"] });
+  const existing = popups.find((win) =>
+    (win.tabs || []).some((tab) => typeof tab.url === "string" && tab.url.startsWith(url))
+  );
+  const { left, top } = await centerOnBrowser(PANEL_WIDTH, PANEL_HEIGHT);
+  const bounds = { left, top, width: PANEL_WIDTH, height: PANEL_HEIGHT, state: "normal" };
+  if (existing) {
+    await chrome.windows.update(existing.id, { ...bounds, focused: true });
+    return;
+  }
+  const created = await chrome.windows.create({
+    url,
+    type: "popup",
+    focused: true,
+    ...bounds
+  });
+  if (created?.id) await chrome.windows.update(created.id, { left, top });
+}
+
+chrome.action.onClicked.addListener(() => {
+  openCenteredPanel().catch((error) => console.error("Could not open the panel.", error));
+});
+
+const SUMMARY_WIDTH = 560;
+const SUMMARY_HEIGHT = 560;
+
+async function openSummaryWindow() {
+  if (summaryOpen) return summaryOpen;
+  summaryOpen = openSummaryWindowOnce().catch((error) => {
+    summaryOpen = null;
+    throw error;
+  });
+  return summaryOpen;
+}
+
+async function openSummaryWindowOnce() {
+  const url = chrome.runtime.getURL("summary.html");
+  const popups = await chrome.windows.getAll({ populate: true, windowTypes: ["popup"] });
+  const existing = popups.find((win) =>
+    (win.tabs || []).some((tab) => typeof tab.url === "string" && tab.url.startsWith(url))
+  );
+  let left = 80;
+  let top = 80;
+  try {
+    const centered = await centerOnBrowser(SUMMARY_WIDTH, SUMMARY_HEIGHT);
+    left = centered.left;
+    top = centered.top;
+  } catch (_error) {
+    /* Open near the top-left if the browser window bounds are unavailable. */
+  }
+  const bounds = { left, top, width: SUMMARY_WIDTH, height: SUMMARY_HEIGHT, state: "normal" };
+  if (existing) {
+    const tab = (existing.tabs || []).find((item) => typeof item.url === "string" && item.url.startsWith(url));
+    await chrome.windows.update(existing.id, { ...bounds, focused: true });
+    if (tab?.id) await chrome.tabs.reload(tab.id);
+    return;
+  }
+  const created = await chrome.windows.create({
+    url,
+    type: "popup",
+    focused: true,
+    ...bounds
+  });
+  if (created?.id) await chrome.windows.update(created.id, { left, top });
+}

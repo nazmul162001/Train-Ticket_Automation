@@ -1,16 +1,15 @@
 {
   "manifest_version": 3,
-  "name": "Rail Auto-Booker",
+  "name": "Train Ticket Automation",
   "version": "1.0.0",
   "description": "Fills Bangladesh Railway e-ticket search, train, coach, and seats at a scheduled time, then stops at OTP.",
-  "permissions": ["storage", "alarms", "scripting", "activeTab"],
+  "permissions": ["storage", "alarms", "scripting", "activeTab", "windows"],
   "host_permissions": ["https://eticket.railway.gov.bd/*"],
   "background": {
     "service_worker": "background.js"
   },
   "action": {
-    "default_title": "Rail Auto-Booker",
-    "default_popup": "popup.html"
+    "default_title": "Train Ticket Automation"
   },
   "content_scripts": [
     {

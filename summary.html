@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Ticket to confirm</title>
+  <link rel="stylesheet" href="summary.css">
+</head>
+<body>
+  <article class="ticket">
+    <p id="mismatch" class="mismatch" hidden></p>
+    <p id="fallback-note" class="fallback-note" hidden></p>
+    <header>
+      <span class="prompt">&gt;_</span>
+      <div>
+        <h1>TICKET TO CONFIRM</h1>
+        <p>Automation stopped at the OTP screen.</p>
+      </div>
+      <span class="hold">HOLD</span>
+    </header>
+
+    <section class="schedule">
+      <div class="leg">
+        <strong id="depart">—</strong>
+        <span id="from">—</span>
+      </div>
+      <div class="duration">
+        <b id="travel">—</b>
+        <i></i>
+      </div>
+      <div class="leg end">
+        <strong id="arrive">—</strong>
+        <span id="to">—</span>
+      </div>
+    </section>
+
+    <dl class="facts">
+      <div>
+        <dt>Train</dt>
+        <dd id="train">—</dd>
+      </div>
+      <div>
+        <dt>Class</dt>
+        <dd id="train-class">—</dd>
+      </div>
+      <div>
+        <dt>Coach</dt>
+        <dd id="coach">—</dd>
+      </div>
+      <div>
+        <dt>Seats</dt>
+        <dd id="seats" class="seats">—</dd>
+      </div>
+      <div class="wide" id="fare-row" hidden>
+        <dt>Fare shown on the site</dt>
+        <dd id="fare">—</dd>
+      </div>
+    </dl>
+
+    <p class="note">After you type the OTP on the railway page, this is the ticket that confirms. This window does not read or send the code.</p>
+  </article>
+  <script src="summary.js"></script>
+</body>
+</html>

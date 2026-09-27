@@ -30,6 +30,11 @@ var SELECTORS = {
     trainList: ".single-trip-wrapper",
     trainName: ".trip-name",
     trainNumber: ".trip-name h2",
+    journeyStart: ".journey-start",
+    journeyEnd: ".journey-end",
+    journeyDate: ".journey-date",
+    journeyLocation: ".journey-location",
+    journeyDuration: ".journey-duration",
     classColumn: ".single-seat-class",
     className: ".seat-class-name",
     availableCount: ".all-seats, .online-seats",
@@ -49,14 +54,13 @@ var SELECTORS = {
     inProgress: "seat-in-progress",
     hidden: "seat-hidden",
     pending: "request_pending",
-    boardingSelect: "#boardingpoint",
     continueButton: "button.continue-btn",
     continueForm: "#confirmbooking"
   },
   otp: {
     // CHECK: component is in the purchase bundle. Confirm it is mounted
     // when the "Enter Your OTP Code" screen is actually visible.
-    container: "app-confirm-booking-otp, .confirm-ticket-otp, .confirm-ticket-otp-wrapper, .otp-verification-card-header",
+    container: "app-confirm-booking-otp, #confirm-ticket-otp-form, #railway-otp-input-wrapper, .confirm-ticket-otp, .confirm-ticket-otp-wrapper, .otp-verification-card-header",
     heading: "h1, h2, h3, h4, h5, .confirm-ticket-otp-header, .otp-verification-card-header, .heading-div"
   },
   payment: {

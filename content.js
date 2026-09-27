@@ -1,5 +1,5 @@
 /**
- * Rail Auto-Booker page driver.
+ * Train Ticket Automation page driver.
  *
  * Hard stop: this file never reads, writes, or submits an OTP field,
  * never reads SMS or the clipboard, and never clicks Verify or payment.
@@ -10,14 +10,19 @@
   const STATE_KEY = "railBookerState";
   const CONFIG_KEY = "railBookerConfig";
   const LOG_KEY = "railBookerLogs";
+  const TICKET_KEY = "railBookerTicket";
   const LOG_LIMIT = 50;
   const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-  const TERMINAL = new Set(["IDLE", "STOPPED_AT_OTP", "ERROR"]);
+  const TERMINAL = new Set(["IDLE", "STOPPED_AT_OTP", "STOPPED_AT_CONTINUE", "ERROR"]);
 
   let busy = false;
   let rerun = false;
   let unloaded = false;
   let otpWatcher = null;
+  let otpTimer = null;
+  let historyHooked = false;
+  let summaryOpened = false;
+  const ACTIVE = new Set(["ARMED", "SEARCHING", "RESULTS", "SEAT_SELECT", "CONTINUE_CLICKED"]);
 
   window.addEventListener("pagehide", () => {
     unloaded = true;
@@ -55,7 +60,7 @@
   async function fail(step, selector, error) {
     if (unloaded) return;
     const state = await getState();
-    if (state.phase === "ERROR" || state.phase === "STOPPED_AT_OTP") return;
+    if (state.phase === "ERROR" || state.phase === "STOPPED_AT_OTP" || state.phase === "STOPPED_AT_CONTINUE") return;
     const detail = error?.message || String(error || "unknown error");
     const message = `ERROR at ${step}${selector ? ` [${selector}]` : ""}: ${detail}`;
     await log(message, "error");
@@ -139,9 +144,7 @@
   }
 
   function isOtpScreen() {
-    if (document.querySelector(SELECTORS.otp.container)) return true;
-    const headings = [...document.querySelectorAll(SELECTORS.otp.heading)].map(textOf).join(" ");
-    return /enter your otp code/i.test(headings) && /verif/i.test(headings);
+    return Boolean(document.querySelector(SELECTORS.otp.container));
   }
 
   function isBlockedDialog(text) {
@@ -186,35 +189,245 @@
     return `https://eticket.railway.gov.bd/booking/train/search?${params.toString()}`;
   }
 
-  async function stopAtOtp() {
+  async function saveTicket(patch) {
+    const stored = await chrome.storage.local.get(TICKET_KEY);
+    const current = stored[TICKET_KEY] || {};
+    const next = { ...current };
+    Object.entries(patch || {}).forEach(([key, value]) => {
+      if (value === undefined || value === null || value === "") return;
+      if (Array.isArray(value) && value.length === 0) return;
+      if (Array.isArray(value)) {
+        next[key] = value;
+        return;
+      }
+      next[key] = typeof value === "string" ? value : String(value);
+    });
+    next.updatedAt = Date.now();
+    await chrome.storage.local.set({ [TICKET_KEY]: next });
+    return next;
+  }
+
+  async function addFallbackNote(line) {
+    const stored = await chrome.storage.local.get(TICKET_KEY);
+    const current = stored[TICKET_KEY]?.fallbackNote || "";
+    const note = current ? `${current} ${line}` : line;
+    await saveTicket({ fallbackNote: note });
+  }
+
+  async function beginTicket(config) {
+    const number = String(config.targetTrain || "").match(/\((\d+)\)/);
+    await chrome.storage.local.set({
+      [TICKET_KEY]: {
+        from: config.fromStation || "",
+        to: config.toStation || "",
+        journeyDate: config.journeyDate || "",
+        trainName: config.targetTrain || "",
+        trainNumber: number ? number[1] : "",
+        trainClass: config.trainClass || "",
+        coach: "",
+        seats: [],
+        depart: "",
+        arrive: "",
+        travelTime: "",
+        fare: "",
+        currency: "৳",
+        updatedAt: Date.now()
+      }
+    });
+  }
+
+  function plain(value) {
+    if (value == null) return "";
+    if (value instanceof Date && !Number.isNaN(value.getTime())) return value.toISOString();
+    if (typeof value === "number") return String(value);
+    if (typeof value === "string") return value.trim();
+    return "";
+  }
+
+  function hasClock(value) {
+    return /\d{1,2}:\d{2}/.test(plain(value));
+  }
+
+  function purchaseModel() {
+    const host = document.querySelector("app-purchase");
+    const context = host?.__ngContext__;
+    if (!Array.isArray(context)) return null;
+    const seen = new Set();
+    const walk = (value, depth) => {
+      if (!value || typeof value !== "object" || depth > 6 || seen.has(value) || value.nodeType) return null;
+      seen.add(value);
+      if (value.selectedTrip && plain(value.selectedTrip.trip_number)) return value;
+      let keys = [];
+      try {
+        keys = Object.keys(value).slice(0, 80);
+      } catch (_error) {
+        return null;
+      }
+      for (const key of keys) {
+        if (/otp/i.test(key)) continue;
+        try {
+          const found = walk(value[key], depth + 1);
+          if (found) return found;
+        } catch (_error) {
+          /* Angular internals can throw on getters. */
+        }
+      }
+      return null;
+    };
+    for (const entry of context) {
+      const found = walk(entry, 0);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  function visibleDeparture() {
+    const nodes = [...document.querySelectorAll("li, p, div")];
+    for (const node of nodes) {
+      if (node.querySelector("input, textarea")) continue;
+      const label = node.querySelector(":scope > span");
+      if (!label || !textOf(label).toLowerCase().startsWith("departure")) continue;
+      const clone = node.cloneNode(true);
+      clone.querySelectorAll("span").forEach((span) => span.remove());
+      const value = textOf(clone);
+      if (hasClock(value)) return value;
+    }
+    return "";
+  }
+
+  async function writeFinalTicket(config) {
+    const stored = await chrome.storage.local.get(TICKET_KEY);
+    const saved = stored[TICKET_KEY] || {};
+    const model = purchaseModel();
+    const trip = model?.selectedTrip || {};
+    const gotNumber = plain(trip.trip_number);
+    const wantedNumber = (String(config?.targetTrain || "").match(/\((\d+)\)/) || [])[1] || "";
+    const usedFallbackTrain = saved.fallbackTrain === "yes" || saved.fallbackTrain === true;
+    const savedNumber = plain(saved.trainNumber);
+    const matchesSaved = !gotNumber || !savedNumber || gotNumber === savedNumber;
+    const matchesRequested = !wantedNumber || !gotNumber || wantedNumber === gotNumber;
+    const sameTrain = matchesRequested || (usedFallbackTrain && matchesSaved);
+    const reserved = Array.isArray(model?.reservedSeats) ? model.reservedSeats : [];
+    const selected = Array.isArray(model?.selectedSeats) ? model.selectedSeats : [];
+    const seats = (reserved.length ? reserved : selected)
+      .map((seat) => plain(seat?.seat_number || seat?.label))
+      .filter(Boolean);
+    const shownDepart = visibleDeparture();
+    const sameSaved = !gotNumber || gotNumber === plain(saved.trainNumber);
+    const depart = shownDepart || plain(trip.departure_date_time) || (sameSaved ? saved.depart : "");
+    const arrive = plain(trip.arrival_date_time) || (sameSaved ? saved.arrive : "");
+    const travelTime = plain(trip.travel_time) || (sameSaved ? saved.travelTime : "");
+    const ticket = {
+      from: plain(trip.origin_city_name) || (sameTrain ? saved.from : ""),
+      to: plain(trip.destination_city_name) || (sameTrain ? saved.to : ""),
+      depart,
+      arrive,
+      travelTime,
+      journeyDate: saved.journeyDate || config?.journeyDate || "",
+      trainName: plain(trip.train_model) || (sameTrain ? saved.trainName : ""),
+      trainNumber: gotNumber || (sameTrain ? saved.trainNumber : ""),
+      trainClass: plain(model?.selectedSeatClass?.type) || (sameTrain ? saved.trainClass : ""),
+      coach: plain(model?.selectedCoach?.floor_name) || (sameTrain ? saved.coach : ""),
+      seats: seats.length ? seats : (sameTrain ? saved.seats || [] : []),
+      fare: Number(model?.ticketFare?.orderValue) > 0 ? String(model.ticketFare.orderValue) : "",
+      currency: plain(model?.currencySign) || "৳",
+      requestedTrain: config?.targetTrain || "",
+      fallbackNote: saved.fallbackNote || "",
+      fallbackTrain: usedFallbackTrain ? "yes" : "",
+      mismatch: Boolean(gotNumber && !matchesRequested && !(usedFallbackTrain && matchesSaved)),
+      manualContinue: config?.continueToOtp !== true,
+      updatedAt: Date.now()
+    };
+    await chrome.storage.local.set({ [TICKET_KEY]: ticket });
+    await log(`OTP trip ${ticket.trainName} (${ticket.trainNumber}): ${ticket.depart || "no departure"} → ${ticket.arrive || "no arrival"} (${ticket.travelTime || "no duration"}).`);
+    if (ticket.mismatch) {
+      await log(`Wrong train. Requested ${ticket.requestedTrain}, page has ${ticket.trainNumber}. Do not enter the OTP.`, "error");
+    }
+    return ticket;
+  }
+
+  function stopOtpWatch() {
     if (otpWatcher) {
       otpWatcher.disconnect();
       otpWatcher = null;
     }
-    const state = await getState();
-    if (state.phase === "STOPPED_AT_OTP") return;
-    await log("Reached OTP screen — stopping automation, please enter the code manually.");
-    await setState({
-      phase: "STOPPED_AT_OTP",
-      lastError: null
-    });
+    if (otpTimer) {
+      clearInterval(otpTimer);
+      otpTimer = null;
+    }
   }
 
-  function watchForOtp(timeout = 120000) {
-    if (otpWatcher) otpWatcher.disconnect();
-    otpWatcher = new MutationObserver(() => {
-      if (isOtpScreen()) stopAtOtp();
-      else if (SELECTORS.payment.path.test(location.pathname)) {
-        fail("CONTINUE_CLICKED", "payment-url", "Payment page detected. Automation stopped without paying.");
+  async function openSummary(phase, message) {
+    if (summaryOpened || unloaded) return;
+    summaryOpened = true;
+    const state = await getState();
+    if (!ACTIVE.has(state.phase)) {
+      summaryOpened = false;
+      return;
+    }
+    stopOtpWatch();
+    try {
+      await writeFinalTicket(await getConfig());
+    } catch (error) {
+      await log(`Could not read the booked trip: ${error?.message || error}.`, "error");
+    }
+    await log(message);
+    await setState({ phase, lastError: null });
+    try {
+      const response = await chrome.runtime.sendMessage({ type: "SHOW_SUMMARY" });
+      if (!response?.ok) await log(`Summary window did not open: ${response?.error || "unknown error"}.`, "error");
+    } catch (error) {
+      await log(`Summary window did not open: ${error?.message || error}.`, "error");
+    }
+  }
+
+  async function stopAtOtp() {
+    await openSummary("STOPPED_AT_OTP", "OTP screen is open. Automation stopped. Check the summary before you enter the code.");
+  }
+
+  async function stopBeforeContinue() {
+    await openSummary("STOPPED_AT_CONTINUE", "Seats are selected. Click Continue Purchase yourself. Automation stopped.");
+  }
+
+  async function maybeStopForOtp() {
+    if (summaryOpened || unloaded) return;
+    if (!isOtpScreen()) {
+      if (!SELECTORS.payment.path.test(location.pathname || "")) return;
+      const state = await getState();
+      if (state.phase === "CONTINUE_CLICKED" || state.phase === "SEAT_SELECT") {
+        await fail("CONTINUE_CLICKED", "payment-url", "Payment page detected. Automation stopped without paying.");
       }
-    });
-    otpWatcher.observe(document.documentElement, { childList: true, subtree: true });
-    setTimeout(() => {
-      if (otpWatcher) {
-        otpWatcher.disconnect();
-        otpWatcher = null;
-      }
-    }, timeout);
+      return;
+    }
+    await stopAtOtp();
+  }
+
+  function armOtpWatch() {
+    if (!historyHooked) {
+      historyHooked = true;
+      const notify = () => { maybeStopForOtp(); };
+      const push = history.pushState.bind(history);
+      const replace = history.replaceState.bind(history);
+      history.pushState = (...args) => {
+        const result = push(...args);
+        notify();
+        return result;
+      };
+      history.replaceState = (...args) => {
+        const result = replace(...args);
+        notify();
+        return result;
+      };
+      window.addEventListener("popstate", notify);
+    }
+    if (!otpWatcher && document.documentElement) {
+      otpWatcher = new MutationObserver(() => {
+        maybeStopForOtp();
+      });
+      otpWatcher.observe(document.documentElement, { childList: true, subtree: true });
+    }
+    if (!otpTimer) otpTimer = setInterval(() => { maybeStopForOtp(); }, 400);
+    maybeStopForOtp();
   }
 
   async function clickAgreeIfPresent() {
@@ -322,6 +535,7 @@
       return;
     }
     if (kind === "results") {
+      await beginTicket(config);
       await setState({ phase: "RESULTS" });
       await runResults(config);
       return;
@@ -331,6 +545,7 @@
       return;
     }
     const url = buildSearchUrl(config);
+    await beginTicket(config);
     await log(`Opening search results: ${url}`);
     await setState({ phase: "RESULTS", searchUrl: url });
     location.href = url;
@@ -363,17 +578,35 @@
   }
 
   function cardMatches(card, needle) {
-    const visible = textOf(card).toLowerCase();
-    if (visible.includes(needle)) return true;
     const trip = tripRecord(card);
-    if (!trip) return false;
-    const blob = `${trip.trip_number || ""} ${trip.train_model || ""}`.toLowerCase();
-    return blob.includes(needle);
+    const heading = textOf(card.querySelector(SELECTORS.results.trainName));
+    const blob = `${heading} ${trip?.trip_number || ""} ${trip?.train_model || ""}`;
+    const number = String(needle).match(/\((\d+)\)/);
+    if (number) return new RegExp(`(^|[^0-9])${number[1]}([^0-9]|$)`).test(blob);
+    return blob.toLowerCase().includes(String(needle).trim().toLowerCase());
+  }
+
+  const CLASS_ORDER = ["AC_B", "AC_S", "SNIGDHA", "F_BERTH", "F_SEAT", "F_CHAIR", "S_CHAIR", "SHOVAN", "SHULOV", "AC_CHAIR"];
+
+  function classCodeFromText(value) {
+    const raw = String(value || "").trim().toUpperCase();
+    const aliases = {
+      "AC BERTH": "AC_B",
+      "AC SEAT": "AC_S",
+      "AC CHAIR": "AC_CHAIR",
+      "FIRST BERTH": "F_BERTH",
+      "FIRST SEAT": "F_SEAT",
+      "FIRST CHAIR": "F_CHAIR",
+      "SHOVON CHAIR": "S_CHAIR",
+      SHOVON: "SHOVAN"
+    };
+    return aliases[raw] || raw;
   }
 
   function classColumn(card, trainClass) {
+    const wanted = classCodeFromText(trainClass);
     const columns = [...card.querySelectorAll(SELECTORS.results.classColumn)];
-    return columns.find((column) => textOf(column.querySelector(SELECTORS.results.className)).toUpperCase() === trainClass.toUpperCase()) || null;
+    return columns.find((column) => classCodeFromText(textOf(column.querySelector(SELECTORS.results.className))) === wanted) || null;
   }
 
   function availableCount(column) {
@@ -383,6 +616,50 @@
       if (/^\d+$/.test(raw)) return Number(raw);
     }
     return null;
+  }
+
+  function columnIsBookable(column) {
+    if (!column) return false;
+    const book = column.querySelector(SELECTORS.results.bookNow);
+    if (!book || book.disabled) return false;
+    if (column.querySelector(SELECTORS.results.unavailableWrap)) return false;
+    return availableCount(column) !== 0;
+  }
+
+  function classEntries(card) {
+    return [...card.querySelectorAll(SELECTORS.results.classColumn)].map((column) => ({
+      column,
+      name: classCodeFromText(textOf(column.querySelector(SELECTORS.results.className))),
+      count: availableCount(column),
+      bookable: columnIsBookable(column)
+    })).filter((item) => item.name);
+  }
+
+  function rankBookable(entries, quantity) {
+    return entries.filter((item) => item.bookable).sort((a, b) => {
+      const aFit = a.count === null || a.count >= quantity ? 1 : 0;
+      const bFit = b.count === null || b.count >= quantity ? 1 : 0;
+      return bFit - aFit || (b.count || 0) - (a.count || 0);
+    });
+  }
+
+  function selectionFor(card, config) {
+    const requested = classCodeFromText(config.trainClass);
+    const quantity = Number(config.seatQuantity) || 1;
+    const entries = classEntries(card);
+    const wanted = entries.find((item) => item.name === requested && item.bookable);
+    if (wanted) return { entry: wanted, classFallback: false, entries };
+    if (!config.allowClassFallback) return { entry: null, classFallback: false, entries };
+    const ranked = rankBookable(entries, quantity);
+    if (!ranked.length) return { entry: null, classFallback: false, entries };
+    return { entry: ranked[0], classFallback: ranked[0].name !== requested, entries };
+  }
+
+  async function openClassSearch(config, trainClass, triedClasses) {
+    const url = buildSearchUrl({ ...config, trainClass });
+    await log(`Checking class ${trainClass} for ${config.targetTrain}.`);
+    await setState({ phase: "RESULTS", activeClass: trainClass, triedClasses, searchUrl: url });
+    location.href = url;
   }
 
   async function runResults(config) {
@@ -414,34 +691,130 @@
       return;
     }
 
-    const card = [...document.querySelectorAll(SELECTORS.results.trainList)].find((item) => cardMatches(item, needle));
-    if (!card) {
-      await fail("RESULTS", SELECTORS.results.trainName, `No train matched "${config.targetTrain}".`);
+    const state = await getState();
+    const cards = [...document.querySelectorAll(SELECTORS.results.trainList)];
+    const requestedClass = classCodeFromText(config.trainClass);
+    const tried = new Set((state.triedClasses || []).map((item) => classCodeFromText(item)));
+    tried.add(requestedClass);
+    if (state.activeClass) tried.add(classCodeFromText(state.activeClass));
+
+    const target = cards.find((item) => cardMatches(item, needle));
+    let card = target || null;
+    let choice = target ? selectionFor(target, config) : null;
+
+    if (target && !choice.entry && config.allowClassFallback && choice.entries.length <= 1) {
+      const next = CLASS_ORDER.find((name) => !tried.has(name));
+      if (next) {
+        tried.add(next);
+        await openClassSearch(config, next, [...tried]);
+        return;
+      }
+    }
+
+    if (!target && !config.allowTrainFallback && config.allowClassFallback) {
+      const next = CLASS_ORDER.find((name) => !tried.has(name));
+      if (next) {
+        tried.add(next);
+        await openClassSearch(config, next, [...tried]);
+        return;
+      }
+    }
+
+    if ((!card || !choice?.entry) && config.allowTrainFallback) {
+      const quantity = Number(config.seatQuantity) || 1;
+      const others = cards
+        .filter((item) => item !== target)
+        .map((item) => ({ item, choice: selectionFor(item, config) }))
+        .filter((item) => item.choice.entry)
+        .sort((a, b) => {
+          if (a.choice.classFallback !== b.choice.classFallback) return a.choice.classFallback ? 1 : -1;
+          const aCount = a.choice.entry.count || 0;
+          const bCount = b.choice.entry.count || 0;
+          const aFit = a.choice.entry.count === null || aCount >= quantity ? 1 : 0;
+          const bFit = b.choice.entry.count === null || bCount >= quantity ? 1 : 0;
+          return bFit - aFit || bCount - aCount;
+        });
+      if (others.length) {
+        card = others[0].item;
+        choice = others[0].choice;
+      }
+    }
+
+    if (!choice?.entry && config.allowClassFallback) {
+      const singleColumn = !target || choice.entries.length <= 1;
+      const next = singleColumn ? CLASS_ORDER.find((name) => !tried.has(name)) : null;
+      if (next) {
+        tried.add(next);
+        await openClassSearch(config, next, [...tried]);
+        return;
+      }
+    }
+
+    if (!choice?.entry) {
+      if (!target) {
+        const extra = config.allowTrainFallback ? ", and no other train has seats" : "";
+        await fail("RESULTS", SELECTORS.results.trainName, `No train matched "${config.targetTrain}"${extra}.`);
+        return;
+      }
+      const wantedColumn = classColumn(target, requestedClass);
+      const count = wantedColumn ? availableCount(wantedColumn) : null;
+      let detail = `No online seats for ${config.trainClass}${count === null ? "" : ` (count ${count})`}.`;
+      if (!config.allowClassFallback) detail += ` Tick "Any class if this one is full" to use another class.`;
+      else if (!config.allowTrainFallback) detail += ` No other class on this train has seats.`;
+      else detail += ` No other class or train has seats.`;
+      await fail("RESULTS", SELECTORS.results.bookNow, detail);
       return;
     }
 
-    const column = classColumn(card, config.trainClass);
-    if (!column) {
-      await fail("RESULTS", SELECTORS.results.className, `Class ${config.trainClass} is not on that train card.`);
-      return;
-    }
-
-    const count = availableCount(column);
+    const column = choice.entry.column;
+    const bookedClass = choice.entry.name;
+    const trainFallback = card !== target;
     const book = column.querySelector(SELECTORS.results.bookNow);
-    if (!book || book.disabled || column.querySelector(SELECTORS.results.unavailableWrap) || count === 0) {
-      await fail("RESULTS", SELECTORS.results.bookNow, `No online seats for ${config.trainClass}${count === null ? "" : ` (count ${count})`}.`);
+    if (!book) {
+      await fail("RESULTS", SELECTORS.results.bookNow, `Book Now is missing for ${bookedClass}.`);
       return;
     }
 
-    await log(`Booking ${config.targetTrain} / ${config.trainClass}${count === null ? "" : ` (${count} shown)`}.`);
-    await setState({ phase: "SEAT_SELECT" });
+    const trip = tripRecord(card) || {};
+    const heading = textOf(card.querySelector(SELECTORS.results.trainName));
+    const shownStart = card.querySelector(SELECTORS.results.journeyStart);
+    const shownEnd = card.querySelector(SELECTORS.results.journeyEnd);
+    const shownDepart = textOf(shownStart?.querySelector(SELECTORS.results.journeyDate));
+    const shownArrive = textOf(shownEnd?.querySelector(SELECTORS.results.journeyDate));
+    const shownDuration = textOf(card.querySelector(SELECTORS.results.journeyDuration));
+    const numberText = textOf(card.querySelector(SELECTORS.results.trainNumber));
+    const headingNumber = (heading.match(/\((\d+)\)/) || [])[1] || (/^\d+$/.test(numberText) ? numberText : "");
+    const requestedNumber = (String(config.targetTrain).match(/\((\d+)\)/) || [])[1] || "";
+    const bookedNumber = plain(trip.trip_number) || headingNumber || (trainFallback ? "" : requestedNumber);
+    const bookedName = plain(trip.train_model) || heading || (trainFallback ? "fallback train" : config.targetTrain);
+    await saveTicket({
+      from: textOf(shownStart?.querySelector(SELECTORS.results.journeyLocation)) || trip.origin_city_name || config.fromStation,
+      to: textOf(shownEnd?.querySelector(SELECTORS.results.journeyLocation)) || trip.destination_city_name || config.toStation,
+      depart: shownDepart || plain(trip.departure_date_time) || [plain(trip.departure_date), plain(trip.departure_time)].filter(Boolean).join(" "),
+      arrive: shownArrive || plain(trip.arrival_date_time),
+      travelTime: shownDuration || plain(trip.travel_time),
+      trainName: bookedName,
+      trainNumber: bookedNumber,
+      trainClass: bookedClass,
+      requestedTrain: config.targetTrain,
+      fallbackTrain: trainFallback ? "yes" : "",
+      mismatch: false
+    });
+    if (trainFallback) {
+      await addFallbackNote(`Train ${config.targetTrain} had no seats. Booked ${bookedName}${bookedNumber ? ` (${bookedNumber})` : ""}.`);
+    }
+    if (choice.classFallback) {
+      await addFallbackNote(`Class ${config.trainClass} was full. Booked ${bookedClass}.`);
+    }
+    await log(`Booking ${bookedName} / ${bookedClass}. Card time ${shownDepart || "missing"} → ${shownArrive || "missing"} (${shownDuration || "missing"}).`);
+    await setState({ phase: "SEAT_SELECT", activeClass: "", triedClasses: [] });
     book.click();
     const layout = await waitForSelector(SELECTORS.seats.layout, 8000);
     if (!layout) {
       await fail("SEAT_SELECT", SELECTORS.seats.layout, "Seat map did not open within 8s.");
       return;
     }
-    await runSeatSelect(config);
+    await runSeatSelect({ ...config, trainClass: bookedClass });
   }
 
   function seatIdentity(button) {
@@ -520,7 +893,7 @@
     return null;
   }
 
-  function chooseSeats(seats, quantity, preferredLabels) {
+  function chooseSeats(seats, quantity, preferredLabels, allowSeatFallback) {
     const chosen = [];
     const used = new Set(seats.filter((seat) => seat.selected).map((seat) => seat.label));
     seats.filter((seat) => seat.selected).forEach((seat) => chosen.push(seat));
@@ -533,6 +906,10 @@
         chosen.push(seat);
         used.add(seat.label);
       }
+    }
+
+    if (preferredLabels.length > 0 && !allowSeatFallback) {
+      return chosen.filter((seat) => !seat.selected).slice(0, Math.max(0, quantity - seats.filter((seat) => seat.selected).length));
     }
 
     const available = () => seats.filter((seat) => seat.available && !used.has(seat.label));
@@ -606,37 +983,36 @@
     return textOf(option).split(/\s+-\s+/)[0].trim().toUpperCase();
   }
 
-  async function selectCoach(config, skipped) {
+  async function selectCoach(config, skipped, allowFallback) {
     const select = document.querySelector(SELECTORS.seats.coachSelect);
     if (!select) throw new Error("Coach dropdown is missing.");
     const options = coachOptions().filter((option) => !skipped.has(option.value));
     if (!options.length) return null;
     const preferred = (config.preferredCoach || "").trim().toUpperCase();
     let option = null;
-    if (preferred && !skipped.has(`pref:${preferred}`)) {
-      option = options.find((item) => coachCode(item) === preferred || textOf(item).toUpperCase().startsWith(preferred));
-      skipped.add(`pref:${preferred}`);
+    if (preferred) {
+      const match = options.find((item) => coachCode(item) === preferred);
+      if (match && coachSeatCount(match) !== 0) option = match;
     }
-    if (!option) {
+    const fellBack = !option && Boolean(preferred);
+    if (!option && (allowFallback || !preferred)) {
       option = options.find((item) => {
         const count = coachSeatCount(item);
         const extra = /xtr/i.test(textOf(item));
-        return !extra && count !== 0 && !skipped.has(optionValue(item));
+        return !extra && count !== 0;
       }) || options.find((item) => coachSeatCount(item) !== 0);
     }
     if (!option) return null;
     skipped.add(option.value);
     setNativeValue(select, option.value);
-    await log(`Coach set to ${textOf(option)}.`);
+    await saveTicket({ coach: coachCode(option) });
+    if (fellBack) await log(`Coach ${preferred} is full. Fallback coach ${textOf(option)}.`);
+    else await log(`Coach set to ${textOf(option)}.`);
     await delay(250);
     if (await dismissSafeDialog()) return null;
     await waitFor(() => document.querySelector(`${SELECTORS.seats.layout} ${SELECTORS.seats.seatButton}`), 8000);
     await delay(250);
     return option;
-  }
-
-  function optionValue(option) {
-    return option.value;
   }
 
   async function clickSeat(seat) {
@@ -652,22 +1028,14 @@
     return seat.button.classList.contains(SELECTORS.seats.selected);
   }
 
-  async function ensureBoarding(config) {
-    const select = document.querySelector(SELECTORS.seats.boardingSelect);
-    if (!select) throw new Error("Boarding station dropdown is missing.");
-    const wanted = (config.boardingStation || config.fromStation || "").trim().toLowerCase();
-    const options = [...select.options].filter((option) => option.value);
-    if (wanted) {
-      const match = options.find((option) => textOf(option).toLowerCase().includes(wanted));
-      if (!match) throw new Error(`Boarding station "${config.boardingStation || config.fromStation}" is not in the list.`);
-      if (select.value !== match.value) setNativeValue(select, match.value);
-      await log(`Boarding station: ${textOf(match)}.`);
-      return;
-    }
-    if (!select.value && options[0]) {
-      setNativeValue(select, options[0].value);
-      await log(`Boarding station left on the site default: ${textOf(options[0])}.`);
-    }
+  function continueButton() {
+    const nodes = [...document.querySelectorAll("button, a, input[type='button'], input[type='submit']")];
+    const byText = nodes.find((el) => /continue\s*purchase/i.test((el.innerText || el.value || "").replace(/\s+/g, " ")));
+    const button = byText || document.querySelector(SELECTORS.seats.continueButton);
+    if (!button || button.disabled || button.getAttribute("aria-disabled") === "true") return null;
+    const style = getComputedStyle(button);
+    if (style.display === "none" || style.visibility === "hidden") return null;
+    return button;
   }
 
   async function runSeatSelect(config) {
@@ -678,9 +1046,13 @@
     }
     const preferred = (config.preferredSeats || "").split(",").map((item) => item.trim()).filter(Boolean);
     const skipped = new Set();
-    let coach = await selectCoach(config, skipped);
+    let coach = await selectCoach(config, skipped, config.allowCoachFallback === true);
     if (!coach) {
-      await fail("SEAT_SELECT", SELECTORS.seats.coachSelect, "No coach with seats was available.");
+      const preferredCoach = (config.preferredCoach || "").trim();
+      const detail = preferredCoach && config.allowCoachFallback !== true
+        ? `Coach ${preferredCoach} has no seats. Tick "Any coach if this one is full" to use another coach.`
+        : "No coach with seats was available.";
+      await fail("SEAT_SELECT", SELECTORS.seats.coachSelect, detail);
       return;
     }
 
@@ -695,25 +1067,28 @@
       }
 
       let seats = readSeatGrid();
-      const picks = chooseSeats(seats, quantity, preferred);
+      const picks = chooseSeats(seats, quantity, preferred, config.allowSeatFallback === true);
       await log(`Choosing ${picks.map((seat) => seat.label).join(", ") || "no seats"} in this coach.`);
       for (const seat of picks) {
         seats = readSeatGrid();
         const fresh = seats.find((item) => item.label === seat.label);
         if (!fresh?.available) continue;
         const ok = await clickSeat(fresh);
-        if ((await getState()).phase === "ERROR" || (await getState()).phase === "STOPPED_AT_OTP") return;
+        if ((await getState()).phase === "ERROR" || (await getState()).phase === "STOPPED_AT_OTP" || (await getState()).phase === "STOPPED_AT_CONTINUE") return;
         if (!ok) await log(`Seat ${fresh.label} could not be selected.`, "error");
       }
 
       const selectedCount = readSeatGrid().filter((seat) => seat.selected).length;
       if (selectedCount >= quantity) break;
-      if (!config.allowCoachFallback) {
-        await fail("SEAT_SELECT", SELECTORS.seats.seatButton, `Only ${selectedCount} of ${quantity} seats could be selected.`);
+      if (config.allowCoachFallback !== true) {
+        const seatHint = preferred.length && config.allowSeatFallback !== true
+          ? ` Preferred seats are not available. Tick "Any seats if the ones above are taken" to pick other seats.`
+          : "";
+        await fail("SEAT_SELECT", SELECTORS.seats.seatButton, `Only ${selectedCount} of ${quantity} seats could be selected.${seatHint}`);
         return;
       }
       await log(`Coach has ${selectedCount}/${quantity} seats. Trying another coach.`);
-      coach = await selectCoach({ ...config, preferredCoach: "" }, skipped);
+      coach = await selectCoach({ ...config, preferredCoach: "" }, skipped, true);
       if (!coach) {
         await fail("SEAT_SELECT", SELECTORS.seats.coachSelect, `Only ${selectedCount} of ${quantity} seats could be selected.`);
         return;
@@ -726,15 +1101,36 @@
       return;
     }
 
-    await ensureBoarding(config);
-    const button = document.querySelector(SELECTORS.seats.continueButton);
-    if (!button || button.disabled) {
+    const selectedSeats = readSeatGrid().filter((seat) => seat.selected).map((seat) => seat.label);
+    const wantedCoach = (config.preferredCoach || "").trim().toUpperCase();
+    const gotCoach = coachCode(coach);
+    if (wantedCoach && gotCoach && gotCoach !== wantedCoach) {
+      await addFallbackNote(`Coach ${wantedCoach} was full. Booked ${gotCoach}.`);
+    }
+    const wantedSeats = preferred.map((item) => item.replace(/\s+/g, "").toUpperCase());
+    const missingSeats = wantedSeats.filter((label) => !selectedSeats.includes(label));
+    if (missingSeats.length) {
+      await addFallbackNote(`Seats ${missingSeats.join(", ")} were taken. Booked ${selectedSeats.join(", ")}.`);
+    }
+    await saveTicket({
+      coach: gotCoach || "",
+      seats: selectedSeats
+    });
+    if (config.continueToOtp !== true) {
+      await stopBeforeContinue();
+      return;
+    }
+    await log("Seats selected. Waiting for Continue Purchase.");
+    const button = await waitFor(continueButton, 8000, 150);
+    if (!button) {
       await fail("SEAT_SELECT", SELECTORS.seats.continueButton, "Continue Purchase is missing or disabled.");
       return;
     }
+    button.scrollIntoView({ block: "center", inline: "nearest" });
     await setState({ phase: "CONTINUE_CLICKED" });
     await log("Clicking Continue Purchase.");
     button.click();
+    armOtpWatch();
   }
 
   async function runContinue() {
@@ -747,14 +1143,7 @@
       return;
     }
     await log("Continue Purchase completed. Not filling passenger details, OTP, or payment. Watching for the OTP screen.");
-    const appeared = await waitFor(() => (isOtpScreen() ? true : null), 15000, 200);
-    if (appeared) {
-      await stopAtOtp();
-      return;
-    }
-    if ((await getState()).phase === "ERROR") return;
-    await log("OTP screen is not visible yet. Automation will stop if it appears, and will not type a code.");
-    watchForOtp();
+    armOtpWatch();
   }
 
   async function route(reason) {
@@ -804,12 +1193,12 @@
     getState()
       .then(async (state) => {
         const phase = state.phase || "IDLE";
-        if (phase === "ERROR" || phase === "STOPPED_AT_OTP") {
+        if (phase === "ERROR" || phase === "STOPPED_AT_OTP" || phase === "STOPPED_AT_CONTINUE") {
           sendResponse({ ok: false, error: `Automation is ${phase}.` });
           return;
         }
         if (phase === "ARMED" || phase === "IDLE") {
-          await setState({ phase: "SEARCHING", formFallbackTried: false });
+          await setState({ phase: "SEARCHING", formFallbackTried: false, activeClass: "", triedClasses: [] });
         }
         sendResponse({ ok: true });
         if (phase === "ARMED" || phase === "IDLE" || phase === "SEARCHING") route("START_SEARCH");
@@ -818,5 +1207,6 @@
     return true;
   });
 
+  armOtpWatch();
   route("load");
 })();
